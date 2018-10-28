@@ -1,0 +1,738 @@
+---
+title: "Find Complexes"
+author: "Jeffrey Maurer"
+date: "7 September 2018"
+output: html_document
+---
+
+# Setup
+
+```{r setup, warning=FALSE, message=FALSE}
+library(Hotelling) # transformations
+library(huge)      # graphing???
+library(rsgcc)     # heatmap
+library(gtools)    # invalid
+library(funtimes)  # purity test
+library(entropy)   # 
+library(ggplot2)   # plotting
+library(pscl)      # hurdle and zeroinfl functions by Achim Zeileis
+library(boot)      # not sure, something with zero inflated poisson
+library(plyr)      # count in mutual information2
+library(pROC)      # ROC curve
+library(plyr)      # plot density/histograms
+library(network)   # networks
+library(GGally)    # display network
+library(sna)       # sub to ggnet
+library(scales)    # sub to ggnet
+library(statnet.common) # see above
+library(poweRlaw)  # produce and work with power laws
+library(reshape2)  # melt subgraph into long format... provides an edgelist
+library(RColorBrewer) # color graphic
+library(magic)     # adiag function, add matrices together
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(base.dir = '~/R/direct_contact-master/')
+```
+
+I went to github to find these files along with the script that looks like the researchers' pipeline to help me.
+
+I grabbed the uniprot IDs they used to train their ML model and converted them to Ensembl IDs, as the proteins are annotated in the map file with their ensembl ID. Interestingly, uniprot to ensembl isn't 1-to-1, there are more ensembl IDs than the original number of Uniprot.
+
+```{r read_files}
+data.smaller.smaller<-NULL
+if (file.exists("data.RDS")) {
+  data.smaller.smaller<-readRDS("data.RDS")
+  data.ensembl <- read.table('Hs_all.prot_count_uniqpeps2_FDR0010.txt.map')
+  UtoE <- read.csv("Uniprot_to_Ensembl_test_proteomics.csv", header=TRUE)
+}else {
+  data.raw <- read.table('Hs_all.prot_count_uniqpeps2_FDR0010.txt.gz')
+  data.ensembl <- read.table('Hs_all.prot_count_uniqpeps2_FDR0010.txt.map')
+  row.names(data.raw) <- t(data.ensembl)
+  UtoE <- read.csv("Uniprot_to_Ensembl_test_proteomics.csv", header=TRUE)
+}
+```
+
+Now to run the analysis. The original dataset with 15k proteins is too many to work with computationally when experimenting, and visualization will not have the proper granularity.
+
+```{r smaller}
+if (!file.exists("data.RDS")){
+  which.proteins <- row.names(data.raw) %in% t(UtoE[,2])
+  data.smaller <- data.raw[which.proteins,]
+  remove.proteins <- t(UtoE[,2]) %in% rownames(data.smaller)
+  UtoE <- UtoE[remove.proteins,]
+  data.smaller.num <- sapply(data.smaller, as.numeric)
+  rownames(data.smaller.num) <- rownames(data.smaller)
+  dim(data.smaller.num)
+  # get the number of proteins with lesss than 50 data nonzero values
+  sum(rowSums(data.smaller.num>0) < 50)
+  data.smaller.smaller<-data.smaller.num[rowSums(data.smaller.num>0) > 50,]
+  dim(data.smaller.smaller)
+  # get the number of columns with less than 10 nonzero values
+  sum(colSums(data.smaller.smaller>0)<10)
+  data.smaller.smaller<- data.smaller.smaller[,colSums(data.smaller.smaller>0)>10]
+  dim(data.smaller.smaller)
+  saveRDS(object = data.smaller.smaller, file = "data.RDS")
+} else {
+  remove.proteins <- t(UtoE[,2]) %in% rownames(data.smaller.smaller)
+  UtoE <- UtoE[remove.proteins,]
+}
+```
+
+It would be nice to have a membership matrix. It shall be a matrix where both the rows and columns are the proteins, and the values are 1 or 0. If the two proteins are of the same complex, then that value is 1, otherwise 0.
+
+```{r make_membership}
+if (!file.exists("member.RDS"))
+{
+  protein_conversion <- UtoE[UtoE[,2] %in% rownames(data.smaller.smaller),]
+  membership<-outer(X=1:nrow(protein_conversion),
+                    Y=1:nrow(protein_conversion), 
+                    FUN = Vectorize(function(x,y) {
+                      protein_conversion[x,3] == protein_conversion[y,3]
+                    }))
+  rownames(membership) = protein_conversion[,2]
+  colnames(membership) = protein_conversion[,2]
+  saveRDS(membership, "member.RDS")
+} else {
+  membership <- readRDS("member.RDS")
+}
+```
+
+# Calculate Mutual Information
+
+
+```{r MI, eval=FALSE, include=FALSE}
+k <- knnmi.all(data.smaller.smaller)
+levelplot(k)
+hist(unlist(k))
+# This is generating some weird results. I will move onto just writing my own code. I will write two functions using the two definitions of MI to make sure that I am doing this correctly. The chances that I screw up two ways to get the same results from each is minimal.
+```
+
+
+```{r manual_MI}
+data.smaller.smaller.binary <- matrix(as.integer(data.smaller.smaller > 0), nrow = nrow(data.smaller.smaller), ncol = ncol(data.smaller.smaller))
+dim(data.smaller.smaller.binary)
+
+# x: vector of binary values
+# y: vector of binary values
+# output: mutual information between the two vectors
+mutual_information <- function(x,y){
+  if (length(x) != length(y)) {
+    stop("Length of x and y not the same.")
+  }
+  # p(x,y)log_2(p(x,y)/(p(x)p(y)))
+  # The cases are: p(x = 0, y = 0), p(x = 0, y = 1), p(x = 1, y = 0), p(x = 1, y = 1)
+  xy <- x & y
+  p_x <- sum(x) / length(x)
+  p_y <- sum(y) / length(y)
+  p_00 <- sum(as.integer((x == 0) & (y == 0))) / length(x)
+  p_01 <- sum(as.integer((x == 0) & (y == 1))) / length(x)
+  p_10 <- sum(as.integer((x == 1) & (y == 0))) / length(x)
+  p_11 <- sum(as.integer((x == 1) & (y == 1))) / length(x)
+  MI<-sum(
+    p_00*log2(p_00/((1-p_x)*(1-p_y))),
+    p_01*log2(p_01/((1-p_x)*p_y)),
+    p_10*log2(p_10/(p_x*(1-p_y))),
+    p_11*log2(p_11/(p_x*p_y)),
+    na.rm = TRUE
+  )
+  return(MI)
+}
+
+# counts: vector of counts. The counts should be of each distinct state of a variable
+shannon_entropy <- function(counts) {
+  normalized_counts <- counts / sum(counts)
+  normalized_nonzero_counts <- normalized_counts[normalized_counts != 0]
+  H <- sum(normalized_nonzero_counts*log2(1/normalized_nonzero_counts))
+  return(H)
+}
+
+# x: vector of binary values
+# y: vector of binary values
+# output: mutual information between the two vectors
+mutual_information_shannon <- function(x,y){
+  c_X = data.frame(table(x))[,2]
+  c_Y = data.frame(table(y))[,2]
+  require(plyr)
+  c_XY = count(cbind(x, y))[,3]
+
+  H_X = shannon_entropy(c_X)
+  H_Y = shannon_entropy(c_Y)
+  H_XY = shannon_entropy(c_XY)
+
+  MI = H_X + H_Y - H_XY
+  return(MI)
+}
+```
+
+
+```{r test_mi_function, eval=FALSE, include=FALSE}
+# Test cases
+# no information gained from two uniform distributions
+a = c(1,1,1,1)
+b = c(1,1,1,1)
+c(mutual_information(a, b), mutual_information_shannon(a,b))
+
+# no information gained from a distribution with the uniform distribution
+a = c(1,1,1,0)
+b = c(1,1,1,1)
+c(mutual_information(a, b), mutual_information_shannon(a,b))
+
+# some information gained, 1 & 1 and 0 & 0 more likely than 0 & 1 and 1 & 0 
+a = c(1,1,1,0)
+b = c(1,1,1,0)
+c(mutual_information(a, b), mutual_information_shannon(a,b))
+
+# some information gained, 1&1 more likely than 1&0, 0&0 and from 0&1
+a = c(1,1,1,0)
+b = c(1,0,1,0)
+c(mutual_information(a, b), mutual_information_shannon(a,b))
+
+# no information, evenly distributed
+a = c(0,1,1,0)
+b = c(1,0,1,0)
+c(mutual_information(a, b), mutual_information_shannon(a,b))
+
+# some information, 1&1 more likely than even distribution
+a = c(0,1,1,0,1)
+b = c(1,0,1,0,1)
+c(mutual_information(a, b), mutual_information_shannon(a,b))
+```
+
+The functions work. In a section of code that I have hidden, I show that in a number of test cases, the two functions equal each other and give expected output. Now to calculate the MI between all proteins.
+
+```{r run_mi, eval=TRUE, include=TRUE}
+
+# mat: binary matrix with rows being compared classes
+# output: matrix with MIs of all rows
+similarity_all <- function(mat, fun=mutual_information){
+  outer(1:nrow(mat),
+        1:nrow(mat), 
+        FUN = Vectorize(function(x,y) {
+          fun(mat[x,], mat[y,])
+        }))
+}
+
+mi<-similarity_all(data.smaller.smaller.binary)
+
+# The binary matrix has no labels, it needs to be added back
+rownames(mi) <- rownames(data.smaller.smaller)
+colnames(mi) <- rownames(data.smaller.smaller)
+
+saveRDS(mi, "MI_matrix.RDS")
+
+hist(mi)
+
+levelplot(mi)
+```
+
+```{r get_contacts, eval = FALSE, include=FALSE}
+# We need contact... well... we need membership
+contacts <- read.csv(file="true_contact.csv", header=TRUE)
+g <- graph.data.frame(contacts, directed=FALSE)
+contacts <- get.adjacency(g, attr="is_true_contact", sparse=FALSE)
+# Make sure that mi and contacts have the same names
+dim(contacts)
+contacts <- contacts[rownames(contacts) %in% rownames(mi), colnames(contacts) %in% colnames(mi)]
+dim(contacts)
+dim(mi)
+mi <- mi[rownames(mi) %in% rownames(contacts), colnames(mi) %in% colnames(contacts)]
+dim(mi)
+mi <- mi[rownames(contacts), colnames(contacts)]
+mi[1:3,1:3]
+contacts[1:3,1:3]
+```
+
+# Analyze MI Distribution
+
+Are the MI values for membership different than in nonmembership? Let's find out. We know what is in complex with what, so we can use that to separate the matrix into two sets: MI of membership and MI of noncmembership. Ideally, we would want these two distributions to not overlap very much.
+
+```{r separate}
+# The values of membership
+membership_mi <- mi[membership]
+hist(membership_mi)
+
+# The values of nonmembership proteins
+nonmembership_mi <- mi[!membership]
+hist(nonmembership_mi, xlim = c(0,0.5))
+
+# This is not so easy to see
+hist(nonmembership_mi, ylim = c(0,2500), xlim = c(0,0.5))
+
+# Overlay the plots
+hist(nonmembership_mi, col='blue', xlim=c(0, 1))
+hist(membership_mi, col='red', breaks = 20, add=T)
+
+cat(paste("mean(membership_mi)", "mean(nonmembership_mi)", sep = " > "))
+cat(paste(mean(membership_mi), mean(nonmembership_mi), sep = " > "))
+```
+
+```{r mi_statistics, eval = FALSE, include=FALSE}
+# some simple stastics tests for determining how different the distributions are
+chisq.test(membership_mi, nonmembership_mi)
+
+# bootstrapped p-value
+p <- 0
+for (i in 1:100000) {
+    ncmi <- sample(nonmembership_mi, size = 100, replace = TRUE)
+    cmi  <- sample(membership_mi, size = 100, replace = TRUE)
+    p <- p + as.integer(mean(cmi) < mean(ncmi))
+}
+# The bootstrapped p-value
+p / 100000
+
+
+# Logistic Regression
+TF <- data.frame(membership=as.vector(membership), mi=as.vector(mi))
+mylogit <- glm(membership ~ mi, data = TF, family = "binomial")
+summary(mylogit)
+confint(mylogit)
+roc(TF$membership, TF$mi, plot = TRUE)
+
+# Look for a cutoff...
+for (i in seq(0,1,0.1)){
+    cat(paste("The cutoff is: ", i, '\n'))
+    cat(paste("nonmembership: ", sum(nonmembership_mi > i)/sum(nonmembership_mi > 0), '\n'))
+    cat(paste("membership: ", sum(membership_mi > i)/sum(membership_mi > 0), '\n\n'))
+}
+```
+
+There is still not a very good separation between the two. In an portion of code I have hidden, I have included some statistics to show the separation between the two groups and the results seem mixed when compared to the histogram.
+
+```{r jaccard, include=FALSE, eval=FALSE}
+# Let's see if using other metrics along with this one might improve what's happening here.
+jaccard<-function(x, y) {
+  # J(A,B)=(A&B)/(A|B)
+  if (length(x) != length(y)) {
+    stop("Length of x and y not the same.")
+  }
+  if (sum(x|y)==0) return (1)
+  return(sum(x&y)/sum(x|y))
+}
+
+jaccard(c(0,0,0), c(0,0,0))
+
+jaccard(c(0,1,0), c(1,1,0))
+
+# Good, the function works. Let's see what it can do to help me.
+
+j<-similarity_all(data.smaller.smaller.binary, fun = jaccard)
+
+rownames(j) <- rownames(data.smaller.smaller)
+colnames(j) <- rownames(data.smaller.smaller)
+
+j <- j[rownames(j) %in% rownames(membership), colnames(j) %in% colnames(membership)]
+
+j[1:5,1:5]
+
+# The values of membership
+membership_j <- j[membership]
+hist(membership_j, breaks = 20)
+# The values of nonmembership proteins
+nonmembership_j <- j[!membership]
+hist(nonmembership_j)
+
+# Overlay the plots
+hist(nonmembership_j, col='blue', xlim=c(0, 1))
+hist(membership_j, col='red', add=T)
+# Prettier version of the overlay
+TF <- data.frame(membership=as.vector(membership), j=as.vector(j))
+ggplot(TF, aes(x=j, color=membership)) + 
+  geom_histogram(fill="white", position="dodge") + 
+  theme(legend.position="top") + 
+  geom_vline(data=ddply(TF, "membership", summarise, grp.mean=mean(j)), aes(xintercept=grp.mean, color=membership),linetype="dashed") + 
+  geom_vline(data=ddply(TF, "membership", summarise, grp.mean=median(j)), aes(xintercept=grp.mean, color=membership),linetype="solid")
+
+print(paste("mean(membership_j)", "mean(nonmembership_j)", sep = " > "))
+print(paste(mean(membership_j), mean(nonmembership_j), sep = " > "))
+#Jaccard separates very little... How about Sorenson metric?
+```
+
+
+```{r Sorenson, include=FALSE, eval=FALSE}
+sorenson<-function(x, y) {
+  # sorenson(A,B)=(A&B)/(A|B)
+  if (length(x) != length(y)) {
+    stop("Length of x and y not the same.")
+  }
+  if (sum(x|y)==0) return (1)
+  return(2*sum(x&y)/(sum(x) + sum(y)))
+}
+
+sorenson(c(0,1,0), c(0,0,0))
+
+sorenson(c(0,1,0), c(1,1,0))
+
+# Good, the function works. Let's see what it can do to help me.
+
+sorenson<-similarity_all(data.smaller.smaller.binary, fun = sorenson)
+
+rownames(sorenson) <- rownames(data.smaller.smaller)
+colnames(sorenson) <- rownames(data.smaller.smaller)
+
+sorenson <- sorenson[rownames(sorenson) %in% rownames(membership), colnames(sorenson) %in% colnames(membership)]
+
+sorenson[1:5,1:5]
+
+# The values of membership
+membership_sorenson <- sorenson[membership]
+hist(membership_sorenson, breaks = 20)
+# The values of nonmembership proteins
+nonmembership_sorenson <- sorenson[!membership]
+hist(nonmembership_sorenson)
+
+# Overlay the plots
+hist(nonmembership_sorenson, col='blue', xlim=c(0, 1))
+hist(membership_sorenson, col='red', add=T)
+# Prettier version of the overlay
+TF <- data.frame(membership=as.vector(membership), sorenson=as.vector(sorenson))
+ggplot(TF, aes(x=sorenson, color=membership)) + 
+  geom_histogram(fill="white", position="dodge") + 
+  theme(legend.position="top") + 
+  geom_vline(data=ddply(TF, "membership", summarise, grp.mean=mean(sorenson)), aes(xintercept=grp.mean, color=membership),linetype="dashed") + 
+  geom_vline(data=ddply(TF, "membership", summarise, grp.mean=median(sorenson)), aes(xintercept=grp.mean, color=membership),linetype="solid")
+
+print(paste("mean(membership_sorenson)", "mean(nonmembership_sorenson)", sep = " > "))
+print(paste(mean(membership_sorenson), mean(nonmembership_sorenson), sep = " > "))
+#This also does a very bad job. Contacting protein pairs have a LOWER score. It may still be informative, but let's continue on.
+```
+
+# Establish MI Cutoff for Future Analysis
+
+Let's find a good cutoff point. Most nonmembership values are really close to 0. Let's see what type of cutoff works best. Ideally, we would like the distribution of the degrees of the nodes to resemble a power series.
+
+```{r good_cutoff, eval = FALSE, include = TRUE}
+cutoff=0.05
+interim_mi=similarity_all(data.smaller.smaller.binary)
+diag(interim_mi)<-0
+node_degrees = apply(interim_mi, 1, function(x) {sum(x > quantile(membership_mi, cutoff))})
+# node of highest degree
+node_degrees[node_degrees==max(node_degrees)]
+# node of lowest degree
+node_degrees[node_degrees==min(node_degrees)]
+mi_ordered_values <- unique(sort(unlist(interim_mi)))
+interim_mi[interim_mi < quantile(membership_mi, cutoff)] <- 0
+mi_ordered_values <- mi_ordered_values[mi_ordered_values > quantile(membership_mi, cutoff)]
+for (value in quantile(mi_ordered_values, prob = c(0, 0.50, 0.90, 0.99, 0.995, 0.999))) {
+  cat(paste("cutoff ", value, '\n'))
+  cat(paste("number of edges ", sum(interim_mi > value), '\n'))
+  # graph it
+  print(ggnet2(interim_mi))
+  node_degrees = apply(interim_mi, 1, function(x) {sum(x > 0)})
+  interim_mi[interim_mi < value] <- 0
+  h<-hist(node_degrees)
+  d.f <- data.frame(degree = log10(h$breaks[2:length(h$breaks)][h$counts>0]), frequency = log10(h$counts[h$counts>0]))
+  line<-lm(frequency ~ degree, data = d.f)
+  print(summary(line))
+  plot( frequency ~ degree, data = d.f, main = "Log-log Plot", ylab = "Log10 Frequency", xlab = "Log10 Node Degrees")
+  abline( h = 0, lty = 3, col = colors()[ 440 ] )
+  abline(line)
+  # fit_power_law(node_degrees[node_degrees>0], implementation="R.mle")
+}
+```
+
+Let's see what a power series should look like.
+
+```{r power_series}
+distribution <- rpldis(n = 213, xmin = 2, alpha = 25)
+head(distribution)
+h<-hist(distribution)
+d.f <- data.frame( x = h$breaks[2:length(h$breaks)], y = h$counts )
+plot( y ~ x, data = d.f, type = "n", log = "xy", main = "Log-log Plot" )
+abline( h = seq( 0, 100, 10 ), lty = 3, col = colors()[ 440 ] )
+abline( v = seq( 0, 100, 10 ), lty = 3, col = colors()[ 440 ] )
+points( y ~ x, data = d.f )
+#f<-fit_power_law(distribution[distribution>0], implementation="R.mle")
+#summary(f)
+
+# This distribution should be more linear, given that it has more points. It should be a better representative of the best case scenario
+distribution <- rpldis(n = 2130, xmin = 2, alpha = 25)
+head(distribution)
+h<-hist(distribution)
+d.f <- data.frame( x = h$breaks[2:length(h$breaks)], y = h$counts )
+plot( y ~ x, data = d.f, type = "n", log = "xy", main = "Log-log Plot" )
+abline( h = seq( 0, 100, 10 ), lty = 3, col = colors()[ 440 ] )
+abline( v = seq( 0, 100, 10 ), lty = 3, col = colors()[ 440 ] )
+points( y ~ x, data = d.f )
+f<-fit_power_law(distribution[distribution>0], implementation="R.mle")
+summary(f)
+```
+
+
+# Find Dense Subgraphs
+
+```{r dense_subgraph, eval=FALSE, include=FALSE}
+# Here is my attempt to use a premade package, igraph, to solve the problem of dense subgraphs. I did not figure it out last night, so it shall not be evaluated.
+cutoff=0.05
+interim_mi=similarity_all(data.smaller.smaller.binary)
+rownames(interim_mi) <- rownames(data.smaller.smaller)
+colnames(interim_mi) <- rownames(data.smaller.smaller)
+diag(interim_mi)<-0
+interim_mi <- interim_mi[rownames(interim_mi) %in% rownames(membership), colnames(interim_mi) %in% colnames(membership)]
+# I expect the number to be less than 29
+net <- graph_from_adjacency_matrix(interim_mi, mode = "undirected", diag=FALSE)
+num_subgraphs <-count_max_cliques(net)
+dsubgraphes <- cliques(net)
+```
+
+
+```{r self_written_dense_tree, eval=FALSE, include=FALSE}
+# Here is my attempt to find the dense subgraphs using my handwritten code. I believe that it needs to be a recursive function. Whan a node is removed and the graph becomes two separate subgraphs, the function needs to recurse until it finds a most dense graph. This function does not work currently. It may be faster than the other implementation, but in practice, the other implementation runs fast enough. The code below is not evaluated. 
+# Sort of like Kruskal's algorithm
+cutoff=0.05
+interim_mi=similarity_all(data.smaller.smaller.binary)
+rownames(interim_mi) <- rownames(data.smaller.smaller)
+colnames(interim_mi) <- rownames(data.smaller.smaller)
+diag(interim_mi)<-0
+interim_mi <- interim_mi[rownames(interim_mi) %in% rownames(membership), colnames(interim_mi) %in% colnames(membership)]
+node_degrees = apply(interim_mi, 1, function(x) {sum(x > quantile(membership_mi, cutoff))})
+mi_ordered_values <- unique(sort(unlist(interim_mi)))
+interim_mi[interim_mi < quantile(membership_mi, cutoff)] <- 0
+mi_ordered_values <- mi_ordered_values[mi_ordered_values > quantile(membership_mi, cutoff)]
+
+# Performs search to discover a group from the matrix
+# need to test
+new_group <- function(mat) {
+  to_remove = (mat[1,] > 0)
+  for (row in nrow(mat)) {
+    if (sum(mat[row,to_remove]) > 0) {
+      to_remove = to_remove | mat[row,] # if each diagonal is greater than 0, then the value and its adjacencies are removed
+    }
+  }
+  return(c(mat[-to_remove, -to_remove], mat[to_remove, to_remove]))
+}
+
+# To determine when a portion of the graph disconnects and forms a separate subgraph,
+# this function shall count the number of disconnected subgraphs using BFS
+# need to test
+count_groups <- function(mat) {
+  groups <- NULL
+  while(length(mat) > 0) {
+    tmp <- new_group(mat)
+    groups <- c(groups, tmp[2])
+    mat <- tmp$1
+    i = i + 1
+  }
+  return(groups)
+}
+
+# This is a recursive function that takes an adjacency matrix
+# and then removes nodes of lowest degree until it either finds
+# a subgraph that is of highest density or produces subgraphs
+dense_subgraphs <- function(mat) {
+  # while the number of edges is less than the maximum number of edges (n*(n-1), where n is the number of nodes)
+  num_hubs = 1
+  while (sum(mat > 0) < (nrow(mat)*(nrow(mat)-1)) ||
+         length(groups) == 1) { #
+    node_degrees = apply(mat, 1, function(x) {sum(x > 0)})
+    mat <- mat[-which.min(node_degrees), -which.min(node_degrees)]
+    groups = count_groups(mat)
+  }
+  if (length(groups) > 1) {
+    for (group in groups) {
+      dense_subgraphs(group)
+    }
+  }
+  if (sum(mat > 0) < (nrow(mat)*(nrow(mat)-1))) {
+    print(ggnet2(mat))
+  }
+}
+
+dense_subgraphs(interim_mi)
+```
+
+
+Here is my implementation of the simplest version of this algorithm. It takes less than 10 seconds to run.
+
+
+```{r self_written_dense_simple, eval=FALSE, include=FALSE}
+mat=similarity_all(data.smaller.smaller.binary)
+rownames(mat) <- rownames(data.smaller.smaller)
+colnames(mat) <- rownames(data.smaller.smaller)
+diag(mat)<-0
+mat <- mat[rownames(mat) %in% rownames(membership), colnames(mat) %in% colnames(membership)]
+mat[mat < 0.02] <- 0 # quantile(membership_mi, cutoff) 0.102 0.02
+node_degrees = apply(mat, 1, function(x) {sum(x > 0)})
+hist(node_degrees)
+while(length(mat) > 1) {
+  this_subgraph<-mat
+  # if the subgraph has no edges
+  if (sum(this_subgraph > 0) == 0) {
+    print(rownames(this_subgraph))
+    print(ggnet2(this_subgraph))
+    break
+  }
+  # break if the subgraph is of highest density
+  while (sum(this_subgraph > 0) < (nrow(this_subgraph)*(nrow(this_subgraph)-1))) {
+    node_degrees = apply(this_subgraph, 1, function(x) {sum(x > 0)})
+    this_subgraph <- this_subgraph[-which.min(node_degrees), -which.min(node_degrees)]
+  }
+  print(rownames(this_subgraph))
+  print(UtoE[UtoE[,2] %in% rownames(this_subgraph),3])
+  print(ggnet2(this_subgraph))
+  mat <- mat[!(rownames(mat) %in% rownames(this_subgraph)), !(rownames(mat) %in% rownames(this_subgraph))]
+}
+
+mat=similarity_all(data.smaller.smaller.binary)
+rownames(mat) <- rownames(data.smaller.smaller)
+colnames(mat) <- rownames(data.smaller.smaller)
+diag(mat)<-0
+mat <- mat[rownames(mat) %in% rownames(membership), colnames(mat) %in% colnames(membership)]
+mat[mat < 0.102] <- 0 # quantile(membership_mi, cutoff) 0.102 0.02
+node_degrees = apply(mat, 1, function(x) {sum(x > 0)})
+hist(node_degrees)
+while(length(mat) > 1) {
+  this_subgraph<-mat
+  # if the subgraph has no edges
+  if (sum(this_subgraph > 0) == 0) {
+    print(rownames(this_subgraph))
+    print(ggnet2(this_subgraph))
+    break
+  }
+  # break if the subgraph is of highest density
+  while (sum(this_subgraph > 0) < (nrow(this_subgraph)*(nrow(this_subgraph)-1))) {
+    node_degrees = apply(this_subgraph, 1, function(x) {sum(x > 0)})
+    this_subgraph <- this_subgraph[-which.min(node_degrees), -which.min(node_degrees)]
+  }
+  print(rownames(this_subgraph))
+  print(UtoE[UtoE[,2] %in% rownames(this_subgraph),3])
+  print(ggnet2(this_subgraph))
+  mat <- mat[!(rownames(mat) %in% rownames(this_subgraph)), !(rownames(mat) %in% rownames(this_subgraph))]
+}
+```
+
+
+```{r self_written_dense_simple_noncomplete, eval=TRUE, include=TRUE}
+mat=readRDS("MI_matrix.RDS")
+diag(mat)<-0
+mat[mat < 0.102] <- 0 #0.102 0.2339
+node_degrees = apply(mat, 1, function(x) {sum(x > 0)})
+h<-hist(node_degrees)
+d.f <- data.frame(degree = log(h$breaks[2:length(h$breaks)][h$counts>0]), frequency = log(h$counts[h$counts>0]))
+line<-lm(frequency ~ degree, data = d.f)
+summary(line)
+plot( frequency ~ degree, data = d.f, main = "Log-log Plot", ylab = "Log Frequency")
+abline(line)
+densests_matrix = NULL
+k = 0
+while(length(mat) > 1) {
+  k <- k + 1
+  this_subgraph<-mat
+  # if the subgraph has no edges
+  if (sum(this_subgraph > 0) == 0) {
+    print(rownames(this_subgraph))
+    print(ggnet2(this_subgraph))
+    break
+  }
+  subgraphs = list()
+  for (i in 1:(nrow(mat)-2)) {
+    node_degrees = apply(this_subgraph, 1, function(x) {sum(x > 0)})
+    this_subgraph <- this_subgraph[-which.min(node_degrees), -which.min(node_degrees)]
+    subgraphs[[i]] <- this_subgraph
+  }
+  densities <- lapply(X = subgraphs, FUN = function (x) {sum(x)/nrow(x)})
+  densest <- subgraphs[[which.max(densities)]]
+  drownames <- rownames(densest)
+  print(drownames)
+  net = network(densest*6, directed = FALSE, ignore.eval = FALSE, names.eval = "MI")
+  net %v% "complex" <- as.character(UtoE$membership[match(drownames, UtoE$Ensembl)]) 
+  nnet<-matrix(0, nrow(densest), nrow(densest))
+  for (i in 1:nrow(densest)){
+    for (j in 1:nrow(densest)){
+      nnet[i,j] = ifelse(UtoE$membership[UtoE$Ensembl %in% rownames(densest)[i]]==UtoE$membership[UtoE$Ensembl %in% colnames(densest)[j]],
+                         toupper(as.character(UtoE$membership[UtoE$Ensembl %in% colnames(densest)[j]])),
+                         "zzzzwrong") # if the edge is between proteins of different complexes
+    }
+  }
+  num_colors<-length(table(nnet))
+  map_color<-data.frame(membership=rownames(table(nnet)), color=c(brewer.pal(max(3, num_colors),"Set2")[1:(num_colors-1)], "#BEBEBE")) # 3 is min num f colors
+  edge_colors <- map_color[match(nnet[lower.tri(nnet)][densest[lower.tri(densest)]>0], map_color$membership),2]
+  print(ggnet2(net, 
+               color = "complex", 
+               palette = "Set2", 
+               label = "complex", 
+               label.size = 2.9,
+               edge.size = 3,
+               edge.color = as.character(edge_colors)))
+  mat <- mat[!(rownames(mat) %in% drownames), !(rownames(mat) %in% drownames)]
+  new_names <- c(rownames(densests_matrix), drownames)
+  if (is.null(densests_matrix)) {
+    densests_matrix <- densest
+  } else {
+    densests_matrix <- adiag(densests_matrix, densest)
+    rownames(densests_matrix) <- new_names
+    colnames(densests_matrix) <- new_names
+  }
+}
+densest <- densests_matrix
+drownames <- rownames(densest)
+net = network(densest*6, directed = FALSE, ignore.eval = FALSE, names.eval = "MI")
+net %v% "complex" <- toupper(as.character(UtoE$membership[match(drownames, UtoE$Ensembl)])) 
+nnet<-matrix(0, nrow(densest), nrow(densest))
+for (i in 1:nrow(densest)){
+  for (j in 1:nrow(densest)){
+    nnet[i,j] = ifelse(UtoE$membership[UtoE$Ensembl %in% rownames(densest)[i]]==UtoE$membership[UtoE$Ensembl %in% colnames(densest)[j]],
+                       as.character(UtoE$membership[UtoE$Ensembl %in% colnames(densest)[j]]),
+                       "zzzzwrong") # if the edge is between proteins of different complexes
+  }
+}
+colors<-colorRampPalette(colors = c("red", "green", "blue"))
+num_colors <- length(table(nnet))
+map_color<-data.frame(membership=rownames(table(nnet)), color=c(colors(num_colors-1), "#8F8F8F"))
+edge_colors <- map_color[match(nnet[lower.tri(nnet)][densest[lower.tri(densest)]>0], map_color$membership),2]
+my_palette<-colors(num_colors-1)
+complex_names <- rownames(table(net %v% "complex"))
+names(my_palette) <- complex_names
+ggnet2(net, 
+       color = "complex", 
+       palette = my_palette,
+       node.size = 5.5,
+       layout.par = list(repulse.rad = 5000, niter = 5000), # may be slightly smaller than needed to prevent overlap
+       edge.size = "MI",
+       edge.color = as.character(edge_colors),
+       edge.alpha = 0.45) + # seems like a good alpha value
+       geom_point(aes(color = color), size = 5.5, color = "black") +
+       geom_point(aes(color = color), size = 4)
+```
+
+
+```{r old_code, include=FALSE, eval=FALSE}
+  dense_network<-as.network.matrix(x=(interim_mi>0), matrix.type = "adjacency", directed = FALSE, loops = TRUE)
+  ggnet2(dense_network)
+  # Prettier version of the overlay
+TF <- data.frame(membership=as.vector(membership), mi=as.vector(mi))
+ggplot(TF, aes(x=mi, color=membership)) + 
+  geom_histogram(fill="white", position="dodge") + 
+  theme(legend.position="top") + 
+  geom_vline(data=ddply(TF, "membership", summarise, grp.mean=mean(mi)), aes(xintercept=grp.mean, color=membership),linetype="dashed") + 
+  geom_vline(data=ddply(TF, "membership", summarise, grp.mean=median(mi)), aes(xintercept=grp.mean, color=membership),linetype="solid")
+remove_group <- function(mat, to_remove = 1) {
+  if (to_remove == 1) { 
+    to_remove = (mat[to_remove,] > 0)
+    }
+  else {
+    to_remove <- to_remove | (apply((mat[to_remove,] > 0), 2, sum) > 0)
+  }
+  if (sum(to_remove) == length(to_remove)) {
+    return( mat[-to_remove,-to_remove])
+  }
+  else {
+    remove_group(mat, connected)
+  }
+}
+d.f <- data.frame( degree = h$breaks[2:length(h$breaks)], frequency = h$counts )
+line<-lm(log(frequency) ~ log(degree), data = d.f)
+summary(line)
+plot( frequency ~ degree, data = d.f, type = "n", log = "xy", main = "Log-log Plot" )
+abline( h = seq( 0, 100, 10 ), lty = 3, col = colors()[ 440 ] )
+abline( v = seq( 0, 100, 10 ), lty = 3, col = colors()[ 440 ] )
+points( frequency ~ degree, data = d.f )
+abline(line)
+# One thing they seem to forget to tell you in the documentation is that when you import your data your vertex identifiers (which in our case is customer or account numbers) must be changed to number the vertices and that this numbering must be sequential and start from 1. Being used to an environment where the vertex identifiers are arbitrary (and arrays usually start from 0), this one had me puzzled for a while. The error message that tells you your vertex numbering is not what the package expected is spectacularly unhelpful: Error in add.edges(g, as.list(x[, 1]), as.list(x[, 2]), edge.check = edge.check) :  (edge check) Illegal vertex reference in addEdges_R.  Exiting.
+
+  # print(ggnet2(subgraphs[[which.max(densities)]], color = UtoE[UtoE[,2] %in% drownames,3], palette = "Set2", label = UtoE[UtoE[,2] %in% drownames,3], label.size = 2.9))
+  #edge_list <- melt(subgraphs[[which.max(densities)]])
+  #edge_list <- edge_list[edge_list[,3] >0,]
+  #net <- network(edge_list, matrix.type = "edgelist", directed = FALSE, multiple = FALSE)
+  #net %v% "complex" = UtoE[,3]
+  #edge_color <- ifelse(UtoE[UtoE[edge_list[,1],2],3] == UtoE[UtoE[edge_list[,2],2],3], "red", "green")
+  #edge_color <- edge_color[subgraphs[[which.max(densities)]] > 0]
+```
