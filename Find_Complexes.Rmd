@@ -29,8 +29,10 @@ library(poweRlaw)  # produce and work with power laws
 library(reshape2)  # melt subgraph into long format... provides an edgelist
 library(RColorBrewer) # color graphic
 library(magic)     # adiag function, add matrices together
+library(lattice)   # levelplot
+library(igraph)    # fitpowerlaw
 knitr::opts_chunk$set(echo = TRUE)
-knitr::opts_knit$set(base.dir = '~/R/direct_contact-master/')
+#knitr::opts_knit$set(base.dir = '~/R/direct_contact-master/')
 ```
 
 I went to github to find these files along with the script that looks like the researchers' pipeline to help me.
@@ -200,7 +202,6 @@ c(mutual_information(a, b), mutual_information_shannon(a,b))
 The functions work. In a section of code that I have hidden, I show that in a number of test cases, the two functions equal each other and give expected output. Now to calculate the MI between all proteins.
 
 ```{r run_mi, eval=TRUE, include=TRUE}
-
 # mat: binary matrix with rows being compared classes
 # output: matrix with MIs of all rows
 similarity_all <- function(mat, fun=mutual_information){
@@ -248,18 +249,21 @@ Are the MI values for membership different than in nonmembership? Let's find out
 ```{r separate}
 # The values of membership
 membership_mi <- mi[membership]
-hist(membership_mi)
+hist(membership_mi, xlab ="MI", ylab = "Frequency", main = "MI Values Between Known Complex Proteins")
 
 # The values of nonmembership proteins
 nonmembership_mi <- mi[!membership]
-hist(nonmembership_mi, xlim = c(0,0.5))
+hist(nonmembership_mi, xlim = c(0,0.5), xlab ="MI", ylab = "Frequency", main = "MI Values Between Proteins Not In Complex Together")
 
 # This is not so easy to see
-hist(nonmembership_mi, ylim = c(0,2500), xlim = c(0,0.5))
+hist(nonmembership_mi, ylim = c(0,2500), xlim = c(0,0.5), xlab ="MI", ylab = "Frequency", main = "MI Values Between Proteins Not In Complex Together")
+```
 
+```{r plot_both_MI, collapse=TRUE}
 # Overlay the plots
-hist(nonmembership_mi, col='blue', xlim=c(0, 1))
+hist(nonmembership_mi, col='blue', xlim=c(0, 1), xlab ="MI", ylab = "Frequency", main = "MI Values Between Proteins")
 hist(membership_mi, col='red', breaks = 20, add=T)
+legend("topright", c("Non-Complex Proteins", "Complex Proteins"), col=c("blue", "red"), lwd=10)
 
 cat(paste("mean(membership_mi)", "mean(nonmembership_mi)", sep = " > "))
 cat(paste(mean(membership_mi), mean(nonmembership_mi), sep = " > "))
@@ -296,6 +300,8 @@ for (i in seq(0,1,0.1)){
 ```
 
 There is still not a very good separation between the two. In an portion of code I have hidden, I have included some statistics to show the separation between the two groups and the results seem mixed when compared to the histogram.
+
+In some pieces of code that I have hidden, I test this same process' results using two other similarity metrics between vectors, jaccard and sorenson. I continue the analysis using MI, however.
 
 ```{r jaccard, include=FALSE, eval=FALSE}
 # Let's see if using other metrics along with this one might improve what's happening here.
@@ -429,9 +435,10 @@ for (value in quantile(mi_ordered_values, prob = c(0, 0.50, 0.90, 0.99, 0.995, 0
 }
 ```
 
-Let's see what a power series should look like.
 
-```{r power_series}
+
+```{r power_series, include=FALSE, eval=FALSE}
+# Let's see what a power series should look like.
 distribution <- rpldis(n = 213, xmin = 2, alpha = 25)
 head(distribution)
 h<-hist(distribution)
@@ -540,9 +547,6 @@ dense_subgraphs(interim_mi)
 ```
 
 
-Here is my implementation of the simplest version of this algorithm. It takes less than 10 seconds to run.
-
-
 ```{r self_written_dense_simple, eval=FALSE, include=FALSE}
 mat=similarity_all(data.smaller.smaller.binary)
 rownames(mat) <- rownames(data.smaller.smaller)
@@ -599,6 +603,7 @@ while(length(mat) > 1) {
 }
 ```
 
+Here is my implementation of the algorithm. It takes less than 10 seconds to run, so it's relatively fast.
 
 ```{r self_written_dense_simple_noncomplete, eval=TRUE, include=TRUE}
 mat=readRDS("MI_matrix.RDS")
